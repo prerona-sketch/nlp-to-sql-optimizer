@@ -1,0 +1,57 @@
+body {
+    font-family: Arial;
+    background: #f5f5f5;
+}
+
+.container {
+    width: 60%;
+    margin: auto;
+    text-align: center;
+    padding: 30px;
+    margin-top: 40px;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+}
+
+textarea {
+    width: 80%;
+    height: 120px;
+    padding: 10px;
+    margin: 20px 0;
+    border-radius: 8px;
+}
+
+button {
+    padding: 10px 20px;
+    background: blue;
+    color: white;
+    border: none;
+    cursor: pointer;
+    margin: 5px;
+    border-radius: 8px;
+}
+
+button:hover {
+    background: darkblue;
+}
+
+pre {
+    background: #eee;
+    padding: 10px;
+    text-align: left;
+    width: 80%;
+    margin: auto;
+    border-radius: 8px;
+}
+
+table {
+    margin: auto;
+    border-collapse: collapse;
+    margin-top: 20px;
+}
+
+td, th {
+    border: 1px solid black;
+    padding: 10px;
+}

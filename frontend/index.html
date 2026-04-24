@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NLP to SQL Converter</title>
+
+    <!-- Connect CSS file -->
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>NLP to SQL Converter</h1>
+
+    <textarea id="userInput" placeholder="Ask your query..."></textarea>
+
+    <br>
+
+    <button onclick="generateSQL()">Generate SQL</button>
+    <button onclick="clearAll()">Clear</button>
+
+    <h2>SQL Query</h2>
+    <pre id="sqlOutput"></pre>
+
+    <h2>Result</h2>
+    <div id="tableOutput"></div>
+
+</div>
+
+<!-- Connect JS file -->
+<script src="script.js"></script>
+
+</body>
+</html>
+
+<link rel="stylesheet" href="style.css">
+<script src="script.js"></script>
