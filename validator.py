@@ -6,33 +6,22 @@ from transformers import AutoTokenizer, AutoModel
 import sqlglot
 from sqlglot import exp
 
-
 MODEL_NAME = "roberta-base"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME)
 model.eval()
 
-
 def encode_text_to_embedding(text):
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True
-    )
-
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
     with torch.no_grad():
         outputs = model(**inputs)
-
     return outputs.last_hidden_state.mean(dim=1)
-
 
 def cosine_sim(a, b):
     return F.cosine_similarity(a, b).item()
 
-
-def classify_query_intent(question, schema=""):
+def classify_query_intent(question):
     labels = {
         "COUNT": "how many total number count quantity",
         "AGGREGATE": "highest lowest maximum minimum average mean sum total",
@@ -45,301 +34,168 @@ def classify_query_intent(question, schema=""):
     best_score = -1
 
     for label, text in labels.items():
-        label_emb = encode_text_to_embedding(text)
-        score = cosine_sim(q_emb, label_emb)
-
+        l_emb = encode_text_to_embedding(text)
+        score = cosine_sim(q_emb, l_emb)
         if score > best_score:
             best_score = score
             best_label = label
 
     return best_label
 
-
-def parse_sql_to_ast(sql):
-    return sqlglot.parse_one(sql)
-
-
-def extract_sql_components(sql):
-    result = {}
-
-    try:
-        expr = parse_sql_to_ast(sql)
-    except:
-        return result
-
-    select_clause = expr.find(exp.Select)
-    if select_clause:
-        result["select"] = [e.sql() for e in select_clause.expressions]
-
-    from_clause = expr.find(exp.From)
-    if from_clause:
-        result["from"] = from_clause.this.sql()
-
-    where_clause = expr.find(exp.Where)
-    if where_clause:
-        result["where"] = where_clause.this.sql()
-
-    joins = []
-    for join in expr.find_all(exp.Join):
-        joins.append({
-            "type": join.args.get("kind", "INNER"),
-            "table": join.this.sql(),
-            "on": join.args.get("on").sql() if join.args.get("on") else None
-        })
-
-    if joins:
-        result["joins"] = joins
-
-    group_clause = expr.find(exp.Group)
-    if group_clause:
-        result["group_by"] = [e.sql() for e in group_clause.expressions]
-
-    having_clause = expr.find(exp.Having)
-    if having_clause:
-        result["having"] = having_clause.this.sql()
-
-    order_clause = expr.find(exp.Order)
-    if order_clause:
-        result["order_by"] = [e.sql() for e in order_clause.expressions]
-
-    return result
-
-
 def parse_database_schema(schema_text):
     schema = {}
-
     table_patterns = re.findall(r'(\w+)\((.*?)\)', schema_text)
-
-    for table_name, columns_text in table_patterns:
-        schema[table_name] = [col.strip() for col in columns_text.split(",")]
-
+    for table, cols in table_patterns:
+        schema[table] = [c.strip() for c in cols.split(",")]
     return schema
 
+def detect_tables_from_question(question, schema, top_k=3, threshold=0.45):
+    q_emb = encode_text_to_embedding(question)
+    scores = []
+    for t in schema:
+        t_emb = encode_text_to_embedding(t)
+        scores.append((t, cosine_sim(q_emb, t_emb)))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    selected = [t for t, s in scores if s >= threshold][:top_k]
+    return selected if selected else [scores[0][0]]
 
-def fetch_distinct_column_values(conn, table, columns, limit=100):
-    values = {}
-    cursor = conn.cursor()
+def detect_columns_from_question(question, columns):
+    q_emb = encode_text_to_embedding(question)
+    out = []
+    for c in columns:
+        c_emb = encode_text_to_embedding(c.replace("_", " "))
+        if cosine_sim(q_emb, c_emb) > 0.45:
+            out.append(c)
+    return out if out else ["*"]
 
-    for column in columns:
+def extract_value_filters(question, columns, column_values):
+    filters = []
+    q_emb = encode_text_to_embedding(question)
+    for col, vals in column_values.items():
+        for v in vals:
+            if str(v).isnumeric():
+                continue
+            v_emb = encode_text_to_embedding(str(v))
+            if str(v).lower() in question.lower() or cosine_sim(q_emb, v_emb) > 0.55:
+                filters.append(f"{col} = '{v}'")
+    return filters
+
+def extract_numeric_filters(question, columns):
+    filters = []
+    for col in columns:
+        m = re.search(rf"{col.lower()}\s*(>=|<=|>|<|=)\s*(\d+)", question.lower())
+        if m:
+            filters.append(f"{col} {m.group(1)} {m.group(2)}")
+    return filters
+
+def extract_joins_from_schema(schema):
+    joins = []
+    tables = list(schema.keys())
+
+    for i in range(len(tables)):
+        for j in range(i + 1, len(tables)):
+            t1, t2 = tables[i], tables[j]
+
+            for c1 in schema[t1]:
+                for c2 in schema[t2]:
+                    if c1 == c2 and "id" in c1:
+                        joins.append(f"{t1}.{c1} = {t2}.{c2}")
+
+    return list(set(joins))
+
+def fetch_column_values(conn, table, columns, limit=50):
+    out = {}
+    cur = conn.cursor()
+    for c in columns:
         try:
-            cursor.execute(
-                f"SELECT DISTINCT {column} FROM {table} "
-                f"WHERE {column} IS NOT NULL LIMIT {limit}"
-            )
-
-            distinct_values = [str(row[0]) for row in cursor.fetchall()]
-            values[column] = distinct_values
-
+            cur.execute(f"SELECT DISTINCT {c} FROM {table} WHERE {c} IS NOT NULL LIMIT {limit}")
+            out[c] = [str(r[0]) for r in cur.fetchall()]
         except:
-            values[column] = []
-
-    return values
-
+            out[c] = []
+    return out
 
 def infer_numeric_columns(conn, table, columns):
-    numeric_columns = []
-    cursor = conn.cursor()
-
-    for column in columns:
+    numeric = []
+    cur = conn.cursor()
+    for c in columns:
         try:
-            cursor.execute(f"SELECT {column} FROM {table} LIMIT 5")
-            rows = cursor.fetchall()
-
-            for row in rows:
-                if row[0] is not None:
-                    if isinstance(row[0], (int, float)):
-                        numeric_columns.append(column)
+            cur.execute(f"SELECT {c} FROM {table} LIMIT 5")
+            for r in cur.fetchall():
+                if r[0] is not None and isinstance(r[0], (int, float)):
+                    numeric.append(c)
                     break
         except:
             pass
-
-    return numeric_columns
-
+    return numeric
 
 def extract_components_from_question(question, schema_text, conn):
-    question_lower = question.lower()
     schema = parse_database_schema(schema_text)
 
+    tables = detect_tables_from_question(question, schema)
+
+    all_columns = []
+    for t in tables:
+        all_columns += schema[t]
+
     components = {
-        "table": None,
-        "columns": [],
-        "filters": []
+        "tables": tables,
+        "columns": detect_columns_from_question(question, all_columns),
+        "filters": [],
+        "joins": extract_joins_from_schema(schema)
     }
 
-    table_name = detect_table_from_question(question_lower, schema)
-    components["table"] = table_name or list(schema.keys())[0]
+    column_values = {}
+    for t in tables:
+        column_values.update(fetch_column_values(conn, t, schema[t]))
 
-    table = components["table"]
-    all_columns = schema[table]
-
-    detected_columns = detect_columns_from_question(question_lower, all_columns)
-    components["columns"] = detected_columns if detected_columns else ["*"]
-
-    column_values = fetch_distinct_column_values(conn, table, all_columns)
-
-    value_based_filters = extract_value_filters(question_lower, all_columns, column_values)
-    components["filters"].extend(value_based_filters)
-
-    numeric_filters = extract_numeric_filters(question_lower, all_columns)
-    components["filters"].extend(numeric_filters)
-
-    fallback_numeric_filter = extract_fallback_numeric_filter(
-        question_lower,
-        conn,
-        table,
-        all_columns,
-        components["filters"]
-    )
-
-    if fallback_numeric_filter:
-        components["filters"].append(fallback_numeric_filter)
+    components["filters"] += extract_value_filters(question, all_columns, column_values)
+    components["filters"] += extract_numeric_filters(question, all_columns)
 
     return components
 
-
-def detect_table_from_question(question_lower, schema):
-    q_emb = encode_text_to_embedding(question_lower)
-
-    best_table = None
-    best_score = -1
-
-    for table_name in schema:
-        t_emb = encode_text_to_embedding(table_name)
-        score = cosine_sim(q_emb, t_emb)
-
-        if score > best_score:
-            best_score = score
-            best_table = table_name
-
-    return best_table
-
-
-def detect_columns_from_question(question_lower, columns):
-    q_emb = encode_text_to_embedding(question_lower)
-
-    detected_columns = []
-
-    for column in columns:
-        col_text = column.replace("_", " ")
-        c_emb = encode_text_to_embedding(col_text)
-        score = cosine_sim(q_emb, c_emb)
-
-        if score > 0.45:
-            detected_columns.append(column)
-
-    if "names" in question_lower and "name" in columns and "name" not in detected_columns:
-        detected_columns.append("name")
-
-    return detected_columns
-
-
-def extract_value_filters(question_lower, columns, column_values):
-    filters = []
-
-    q_emb = encode_text_to_embedding(question_lower)
-
-    for column, values in column_values.items():
-        for value in values:
-            if str(value).isnumeric():
-                continue
-
-            v_emb = encode_text_to_embedding(str(value))
-            score = cosine_sim(q_emb, v_emb)
-
-            if str(value).lower() in question_lower or score > 0.55:
-                filters.append(f"{column} = '{value}'")
-
-    return filters
-
-
-def extract_numeric_filters(question_lower, columns):
-    filters = []
-
-    for column in columns:
-        pattern = rf"{column.lower()}\s*(>=|<=|>|<|=)\s*(\d+)"
-        match = re.search(pattern, question_lower)
-
-        if match:
-            operator = match.group(1)
-            numeric_value = match.group(2)
-            filters.append(f"{column} {operator} {numeric_value}")
-
-    return filters
-
-
-def extract_fallback_numeric_filter(question_lower, conn, table, columns, existing_filters):
-    numeric_patterns = re.findall(r'(>=|<=|>|<)\s*(\d+)', question_lower)
-
-    numeric_columns = infer_numeric_columns(conn, table, columns)
-
-    if numeric_patterns and len(numeric_columns) == 1:
-        for operator, value in numeric_patterns:
-            candidate_filter = f"{numeric_columns[0]} {operator} {value}"
-
-            if candidate_filter not in existing_filters:
-                return candidate_filter
-
-    return None
-
-
 def build_sql_query(components, intent):
-    if not components:
-        return None
+    tables = components["tables"]
 
-    table = components["table"]
-
+    select_cols = components["columns"]
     if intent == "COUNT":
-        query = f"SELECT COUNT(*) FROM {table}"
-
+        select = "COUNT(*)"
     elif intent == "AGGREGATE":
-        numeric_candidates = [
-            col for col in components["columns"]
-            if col != "*" and any(
-                word in col.lower()
-                for word in ["salary", "price", "amount", "age", "score", "marks"]
-            )
-        ]
-
-        target_col = numeric_candidates[0] if numeric_candidates else "*"
-
-        query = f"SELECT MAX({target_col}) FROM {table}"
-
+        select = f"MAX({select_cols[0]})" if select_cols != ["*"] else "MAX(*)"
     else:
-        select_clause = ", ".join(components["columns"])
-        query = f"SELECT {select_clause} FROM {table}"
+        select = ", ".join(
+            [f"{tables[0]}.{c}" if c != "*" else f"{tables[0]}.*" for c in select_cols]
+        )
+
+    query = f"SELECT {select} FROM {tables[0]}"
+
+    for i in range(1, len(tables)):
+        join = components["joins"][i - 1] if i - 1 < len(components["joins"]) else None
+        if join:
+            query += f" JOIN {tables[i]} ON {join}"
 
     if components["filters"]:
-        where_clause = " AND ".join(components["filters"])
-        query += f" WHERE {where_clause}"
+        query += " WHERE " + " AND ".join(components["filters"])
 
     return query
 
+def is_safe_sql(query):
+    bad = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER"]
+    return not any(b in query.upper() for b in bad)
 
-def validate_and_rewrite_query(question, schema, old_sql, conn):
-    intent = classify_query_intent(question, schema)
+def validate_and_rewrite_query(question, schema_text, old_sql, conn):
+    intent = classify_query_intent(question)
 
-    old_sql_components = extract_sql_components(old_sql)
+    components = extract_components_from_question(question, schema_text, conn)
 
-    question_components = extract_components_from_question(question, schema, conn)
+    sql = build_sql_query(components, intent)
 
-    final_components = {
-        "table": question_components["table"] or old_sql_components.get("from"),
-        "columns": question_components["columns"]
-        if question_components["columns"]
-        else old_sql_components.get("select", ["*"]),
-        "filters": question_components["filters"]
-    }
-
-    if intent == "COUNT":
-        final_components["columns"] = ["*"]
-
-    corrected_sql = build_sql_query(final_components, intent)
+    if not is_safe_sql(sql):
+        return {"error": "unsafe sql"}
 
     return {
         "question": question,
         "old_sql": old_sql,
-        "old_parts": old_sql_components,
-        "question_parts": question_components,
         "intent": intent,
-        "corrected_sql": corrected_sql
+        "corrected_sql": sql,
+        "components": components
     }
