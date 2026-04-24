@@ -33,8 +33,19 @@ def classify_query_intent(question, schema=""):
     if "how many" in question_lower or "count" in question_lower:
         return "COUNT"
 
-    if "max" in question_lower or "highest" in question_lower or "average" in question_lower:
-        return "AGGREGATE"
+    if (
+    "max" in question_lower
+    or "highest" in question_lower
+    or "largest" in question_lower
+    or "min" in question_lower
+    or "lowest" in question_lower
+    or "smallest" in question_lower
+    or "average" in question_lower
+    or "mean" in question_lower
+    or "sum" in question_lower
+    or "total" in question_lower
+):
+    return "AGGREGATE"
 
     return "SELECT"
 
