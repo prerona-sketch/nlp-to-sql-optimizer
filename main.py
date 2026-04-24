@@ -1,6 +1,7 @@
 import re
 import sqlite3
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 import sqlglot
 from sqlglot import exp
@@ -24,30 +25,34 @@ def encode_text_to_embedding(text):
     with torch.no_grad():
         outputs = model(**inputs)
 
-    return outputs.last_hidden_state[:, 0, :]
+    return outputs.last_hidden_state.mean(dim=1)
+
+
+def cosine_sim(a, b):
+    return F.cosine_similarity(a, b).item()
 
 
 def classify_query_intent(question, schema=""):
-    question_lower = question.lower()
+    labels = {
+        "COUNT": "how many total number count quantity",
+        "AGGREGATE": "highest lowest maximum minimum average mean sum total",
+        "SELECT": "show list display records details names data"
+    }
 
-    if "how many" in question_lower or "count" in question_lower:
-        return "COUNT"
+    q_emb = encode_text_to_embedding(question)
 
-    if (
-    "max" in question_lower
-    or "highest" in question_lower
-    or "largest" in question_lower
-    or "min" in question_lower
-    or "lowest" in question_lower
-    or "smallest" in question_lower
-    or "average" in question_lower
-    or "mean" in question_lower
-    or "sum" in question_lower
-    or "total" in question_lower
-):
-    return "AGGREGATE"
+    best_label = None
+    best_score = -1
 
-    return "SELECT"
+    for label, text in labels.items():
+        label_emb = encode_text_to_embedding(text)
+        score = cosine_sim(q_emb, label_emb)
+
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    return best_label
 
 
 def parse_sql_to_ast(sql):
@@ -179,12 +184,13 @@ def extract_components_from_question(question, schema_text, conn):
     components["filters"].extend(numeric_filters)
 
     fallback_numeric_filter = extract_fallback_numeric_filter(
-        question_lower, 
-        conn, 
-        table, 
+        question_lower,
+        conn,
+        table,
         all_columns,
         components["filters"]
     )
+
     if fallback_numeric_filter:
         components["filters"].append(fallback_numeric_filter)
 
@@ -192,20 +198,33 @@ def extract_components_from_question(question, schema_text, conn):
 
 
 def detect_table_from_question(question_lower, schema):
+    q_emb = encode_text_to_embedding(question_lower)
+
+    best_table = None
+    best_score = -1
+
     for table_name in schema:
-        singular_form = table_name[:-1] if table_name.endswith("s") else table_name
+        t_emb = encode_text_to_embedding(table_name)
+        score = cosine_sim(q_emb, t_emb)
 
-        if table_name.lower() in question_lower or singular_form.lower() in question_lower:
-            return table_name
+        if score > best_score:
+            best_score = score
+            best_table = table_name
 
-    return None
+    return best_table
 
 
 def detect_columns_from_question(question_lower, columns):
+    q_emb = encode_text_to_embedding(question_lower)
+
     detected_columns = []
 
     for column in columns:
-        if column.lower() in question_lower:
+        col_text = column.replace("_", " ")
+        c_emb = encode_text_to_embedding(col_text)
+        score = cosine_sim(q_emb, c_emb)
+
+        if score > 0.45:
             detected_columns.append(column)
 
     if "names" in question_lower and "name" in columns and "name" not in detected_columns:
@@ -217,12 +236,17 @@ def detect_columns_from_question(question_lower, columns):
 def extract_value_filters(question_lower, columns, column_values):
     filters = []
 
+    q_emb = encode_text_to_embedding(question_lower)
+
     for column, values in column_values.items():
         for value in values:
-            if str(value).lower() in question_lower:
-                if str(value).isnumeric():
-                    continue
+            if str(value).isnumeric():
+                continue
 
+            v_emb = encode_text_to_embedding(str(value))
+            score = cosine_sim(q_emb, v_emb)
+
+            if str(value).lower() in question_lower or score > 0.55:
                 filters.append(f"{column} = '{value}'")
 
     return filters
@@ -266,6 +290,20 @@ def build_sql_query(components, intent):
 
     if intent == "COUNT":
         query = f"SELECT COUNT(*) FROM {table}"
+
+    elif intent == "AGGREGATE":
+        numeric_candidates = [
+            col for col in components["columns"]
+            if col != "*" and any(
+                word in col.lower()
+                for word in ["salary", "price", "amount", "age", "score", "marks"]
+            )
+        ]
+
+        target_col = numeric_candidates[0] if numeric_candidates else "*"
+
+        query = f"SELECT MAX({target_col}) FROM {table}"
+
     else:
         select_clause = ", ".join(components["columns"])
         query = f"SELECT {select_clause} FROM {table}"
@@ -286,9 +324,14 @@ def validate_and_rewrite_query(question, schema, old_sql, conn):
 
     final_components = {
         "table": question_components["table"] or old_sql_components.get("from"),
-        "columns": question_components["columns"] if question_components["columns"] else old_sql_components.get("select", ["*"]),
+        "columns": question_components["columns"]
+        if question_components["columns"]
+        else old_sql_components.get("select", ["*"]),
         "filters": question_components["filters"]
     }
+
+    if intent == "COUNT":
+        final_components["columns"] = ["*"]
 
     corrected_sql = build_sql_query(final_components, intent)
 
